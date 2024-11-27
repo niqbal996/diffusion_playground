@@ -1,3 +1,0 @@
-[submodule "stablediffusion"]
-	path = stablediffusion
-	url = git@github.com:Stability-AI/stablediffusion.git
