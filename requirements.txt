@@ -1,0 +1,7 @@
+huggingface-hub
+transformers
+torch
+torchvision
+diffusers
+transformers
+xformers
