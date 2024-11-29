@@ -103,7 +103,7 @@ class DepthDataset(Dataset):
         return {
             "pixel_values": image,
             "depth_values": depth,
-            "input_ids": 'crops and weeds' # Empty tensor as placeholder if you don't use text
+            "prompt": '' # Empty tensor as placeholder
         }
     
     
@@ -116,6 +116,17 @@ check_min_version("0.32.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
+def calculate_output_difference(output1, output2):
+    """Calculate various difference metrics between two outputs"""
+    with torch.no_grad():
+            l1_diff = torch.abs(output1 - output2).mean().item()
+            l2_diff = torch.sqrt(((output1 - output2) ** 2).mean()).item()
+            cosine_sim = (
+                F.cosine_similarity(output1.flatten(1), output2.flatten(1))
+            .mean()
+            .item() 
+        )
+    return l1_diff, l2_diff, cosine_sim
 
 def save_model_card(
     args,
@@ -541,6 +552,18 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    parser.add_argument(
+        "--use_single_timestep",
+        type=bool,
+        default=True,
+        help="Whether to use single timestep training as per paper",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=50,
+        help="Number of denoising steps during inference",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -579,6 +602,7 @@ def main():
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    # Initialise your wandb run, passing wandb parameters and any config information
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -586,7 +610,21 @@ def main():
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
+    accelerator.init_trackers(
+        project_name="LOTUS_G_single_image", 
+        init_kwargs={"job_type": "train"}
+    )
 
+    def check_tensor(tensor, name=""):
+        """Debug function to check tensor values"""
+        if torch.isnan(tensor).any():
+            accelerator.print(f"NaN detected in {name}")
+            return False
+        if torch.isinf(tensor).any():
+            accelerator.print(f"Inf detected in {name}")
+            return False
+        return True
+    
     # Disable AMP for MPS.
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
@@ -622,7 +660,9 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, 
+                                                    subfolder="scheduler",
+                                                    prediction_type=args.prediction_type)
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
@@ -762,13 +802,19 @@ def main():
                 range(min(len(train_dataset), args.max_train_samples))
             )
 
+    # 2. For inference, modify the pipeline to use fewer steps
+    def configure_model_for_inference(pipeline, num_inference_steps=50):
+        """Configure the pipeline for efficient inference"""
+        pipeline.scheduler.set_timesteps(num_inference_steps)
+        return pipeline
+
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         depth_values = torch.stack([example["depth_values"] for example in examples])
         
         # Convert string prompts to tokens
-        prompts = [example["input_ids"] for example in examples]
-        input_ids = tokenizer(
+        prompts = [example["prompt"] for example in examples]
+        prompt_tokens = tokenizer(
             prompts,
             padding="max_length",
             max_length=tokenizer.model_max_length,
@@ -779,7 +825,7 @@ def main():
         return {
             "pixel_values": pixel_values,
             "depth_values": depth_values,
-            "input_ids": input_ids
+            "prompt": prompt_tokens
         }
 
     # DataLoaders creation:
@@ -815,12 +861,47 @@ def main():
         unet, optimizer, train_dataloader, lr_scheduler
     )
 
-    if args.use_ema:
-        if args.offload_ema:
-            ema_unet.pin_memory()
-        else:
-            ema_unet.to(accelerator.device)
+    def log_images_and_losses(
+        depth_prediction, 
+        reconstructed_rgb, 
+        depth_prediction_loss, 
+        reconstructed_rgb_loss, 
+        total_loss,
+        vae,
+        global_step,
+        accelerator
+    ):
+        # Only log on main process
+        if not accelerator.is_main_process:
+            return
 
+        # Convert latents to images using VAE
+        with torch.no_grad():
+            # Scale and decode the images
+            depth_prediction = 1 / 0.18215 * depth_prediction
+            reconstructed_rgb = 1 / 0.18215 * reconstructed_rgb
+            
+            depth_images = vae.decode(depth_prediction[:4]).sample  # Take first 4 samples
+            recon_images = vae.decode(reconstructed_rgb[:4]).sample
+            
+            # Convert to numpy and correct format (B,C,H,W) -> (B,H,W,C)
+            depth_images = (depth_images / 2 + 0.5).clamp(0, 1)
+            recon_images = (recon_images / 2 + 0.5).clamp(0, 1)
+            
+            depth_images = depth_images.cpu().permute(0, 2, 3, 1).float().numpy()
+            recon_images = recon_images.cpu().permute(0, 2, 3, 1).float().numpy()
+
+        # Log images
+        accelerator.log(
+            {
+                "depth_predictions": [wandb.Image(img) for img in depth_images],
+                "reconstructed_images": [wandb.Image(img) for img in recon_images],
+                "depth_prediction_loss": depth_prediction_loss.item(),
+                "reconstructed_rgb_loss": reconstructed_rgb_loss.item(),
+                "total_loss": total_loss.item(),
+            },
+                step=global_step,
+            )   
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -927,54 +1008,59 @@ def main():
                     noise += args.noise_offset * torch.randn(
                         (depth_latents.shape[0], depth_latents.shape[1], 1, 1), device=depth_latents.device
                     )
-                if args.input_perturbation:
-                    new_noise = noise + args.input_perturbation * torch.randn_like(noise)
+                    
                 bsz = depth_latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=depth_latents.device)
+                # Use a fixed timestep T (maximum timestep)
+                timesteps = torch.full(
+                    (batch["pixel_values"].shape[0],), 
+                    noise_scheduler.config.num_train_timesteps - 1,
+                    device=depth_latents.device
+                )     
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                if args.input_perturbation:
-                    noisy_latents = noise_scheduler.add_noise(depth_latents, new_noise, timesteps)
-                else:
-                    noisy_latents = noise_scheduler.add_noise(depth_latents, noise, timesteps)
-
+                noisy_latents = noise_scheduler.add_noise(depth_latents, noise, timesteps)
                 concat_latents = torch.cat([image_latents, noisy_latents], dim=1)
                 # TODO Disable text conditioning and only use depth conditioning
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+                encoder_hidden_states = text_encoder(batch["prompt"], return_dict=False)[0]
 
-                # Get the target for loss depending on the prediction type
-                # if args.prediction_type is not None:
-                #     # set prediction_type of scheduler if defined
-                #     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                # Create task embeddings more efficiently
+                angles = torch.zeros(bsz, 2, device=concat_latents.device)
+                angles[:, 1] = torch.pi/2  # [0, π/2] for depth, [π/2, 0] for reconstruction
+                annotation_emb_s_y = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+                reconstruction_emb_s_x = torch.cat([torch.sin(angles.flip(1)), torch.cos(angles.flip(1))], dim=-1)
                 
+                # Get the target for loss depending on the prediction type
+                if args.prediction_type is not None:
+                    # set prediction_type of scheduler if defined
+                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                
+                # Select the target based on the parametrization strategy
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
+                elif noise_scheduler.config.prediction_type == "x_prediction":
+                    target = depth_latents
                 elif noise_scheduler.config.prediction_type == "v_prediction":
                     target = noise_scheduler.get_velocity(depth_latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                if args.dream_training:
-                    noisy_latents, target = compute_dream_and_update_latents(
-                        unet,
-                        noise_scheduler,
-                        timesteps,
-                        noise,
-                        noisy_latents,
-                        target,
-                        encoder_hidden_states,
-                        args.dream_detail_preservation,
-                    )
-
                 # Predict the noise residual and compute loss
-                model_pred = unet(concat_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                depth_prediction_latents = unet(concat_latents, 
+                                  timesteps, 
+                                  encoder_hidden_states, 
+                                  class_labels=annotation_emb_s_y, 
+                                  return_dict=False)[0]
+                
+                depth_prediction = vae.decode(depth_prediction_latents).sample
 
+                if not check_tensor(depth_prediction_latents, "depth_prediction"):
+                    return float("nan"), float("nan"), float("nan"), (0, 0, 0)
                 if args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    depth_prediction_loss = F.mse_loss(depth_prediction_latents.float(), target.float(), reduction="mean")
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
@@ -988,16 +1074,52 @@ def main():
                     elif noise_scheduler.config.prediction_type == "v_prediction":
                         mse_loss_weights = mse_loss_weights / (snr + 1)
 
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
+                    depth_prediction_loss = F.mse_loss(depth_prediction_latents.float(), target.float(), reduction="none")
+                    depth_prediction_loss = depth_prediction_loss.mean(dim=list(range(1, len(depth_prediction_loss.shape)))) * mse_loss_weights
+                    depth_prediction_loss = depth_prediction_loss.mean()
 
+                reconstructed_rgb_latents = unet(concat_latents, 
+                                   timesteps, 
+                                   encoder_hidden_states, 
+                                   class_labels=reconstruction_emb_s_x,
+                                   return_dict=False)[0]
+                
+                reconstructed_rgb = vae.decode(reconstructed_rgb_latents).sample
+                if not check_tensor(reconstructed_rgb_latents, "recon_prediction"):
+                    return float("nan"), float("nan"), float("nan"), (0, 0, 0)
+                
+                reconstructed_rgb_loss = F.mse_loss(reconstructed_rgb_latents, image_latents)
+                
+                if not check_tensor(reconstructed_rgb_loss, "recon_loss"):
+                    return float("nan"), float("nan"), float("nan"), (0, 0, 0)
+                
+                total_loss = depth_prediction_loss + reconstructed_rgb_loss
+                l1_diff, l2_diff, cosine_sim = calculate_output_difference(depth_prediction_latents, reconstructed_rgb_latents)
+                accelerator.log(
+                                    {
+                                        "l1_difference": l1_diff,
+                                        "l2_difference": l2_diff,
+                                        "cosine_similarity": cosine_sim,
+                                        "learning_rate": optimizer.param_groups[0]["lr"],
+                                    },
+                                    step=global_step,
+                                )
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                avg_loss = accelerator.gather(total_loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
-
+                if global_step % 20 == 0:
+                    log_images_and_losses(
+                        depth_prediction=depth_prediction,
+                        reconstructed_rgb=reconstructed_rgb,
+                        depth_prediction_loss=depth_prediction_loss,
+                        reconstructed_rgb_loss=reconstructed_rgb_loss,
+                        total_loss=total_loss,
+                        vae=vae,
+                        global_step=global_step,
+                        accelerator=accelerator
+                    )
                 # Backpropagate
-                accelerator.backward(loss)
+                accelerator.backward(total_loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -1006,12 +1128,6 @@ def main():
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                if args.use_ema:
-                    if args.offload_ema:
-                        ema_unet.to(device="cuda", non_blocking=True)
-                    ema_unet.step(unet.parameters())
-                    if args.offload_ema:
-                        ema_unet.to(device="cpu", non_blocking=True)
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
@@ -1043,7 +1159,13 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": total_loss.detach().item(), 
+                    "depth_loss": depth_prediction_loss.detach().item(), 
+                    "recon_loss": reconstructed_rgb_loss.detach().item(), 
+                    "l1_diff": l1_diff,
+                    "l2_diff": l2_diff  ,
+                    "cosine_sim": cosine_sim,
+                    "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -1051,10 +1173,6 @@ def main():
 
         if accelerator.is_main_process:
             if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
-                if args.use_ema:
-                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                    ema_unet.store(unet.parameters())
-                    ema_unet.copy_to(unet.parameters())
                 log_validation(
                     vae,
                     text_encoder,
@@ -1065,16 +1183,11 @@ def main():
                     weight_dtype,
                     global_step,
                 )
-                if args.use_ema:
-                    # Switch back to the original UNet parameters.
-                    ema_unet.restore(unet.parameters())
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unet = unwrap_model(unet)
-        if args.use_ema:
-            ema_unet.copy_to(unet.parameters())
 
         pipeline = StableDiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
