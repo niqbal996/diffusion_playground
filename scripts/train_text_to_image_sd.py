@@ -111,8 +111,8 @@ if is_wandb_available():
     import wandb
 
 
-# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.32.0.dev0")
+# # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
+# check_min_version("0.32.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -875,21 +875,12 @@ def main():
         if not accelerator.is_main_process:
             return
 
-        # Convert latents to images using VAE
-        with torch.no_grad():
-            # Scale and decode the images
-            depth_prediction = 1 / 0.18215 * depth_prediction
-            reconstructed_rgb = 1 / 0.18215 * reconstructed_rgb
-            
-            depth_images = vae.decode(depth_prediction[:4]).sample  # Take first 4 samples
-            recon_images = vae.decode(reconstructed_rgb[:4]).sample
-            
-            # Convert to numpy and correct format (B,C,H,W) -> (B,H,W,C)
-            depth_images = (depth_images / 2 + 0.5).clamp(0, 1)
-            recon_images = (recon_images / 2 + 0.5).clamp(0, 1)
-            
-            depth_images = depth_images.cpu().permute(0, 2, 3, 1).float().numpy()
-            recon_images = recon_images.cpu().permute(0, 2, 3, 1).float().numpy()
+        # Convert to numpy and correct format (B,C,H,W) -> (B,H,W,C)
+        depth_images = (depth_prediction[:4] / 2 + 0.5).clamp(0, 1)
+        recon_images = (reconstructed_rgb[:4] / 2 + 0.5).clamp(0, 1)
+        
+        depth_images = depth_images.detach().cpu().permute(0, 2, 3, 1).float().numpy()
+        recon_images = recon_images.detach().cpu().permute(0, 2, 3, 1).float().numpy()
 
         # Log images
         accelerator.log(
@@ -900,8 +891,8 @@ def main():
                 "reconstructed_rgb_loss": reconstructed_rgb_loss.item(),
                 "total_loss": total_loss.item(),
             },
-                step=global_step,
-            )   
+            step=global_step,
+        )   
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
