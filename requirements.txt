@@ -4,4 +4,4 @@ torch
 torchvision
 diffusers
 transformers
-xformers
+accelerate
