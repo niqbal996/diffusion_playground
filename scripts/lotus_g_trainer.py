@@ -417,13 +417,23 @@ def main():
                     
                 bsz = depth_latents.shape[0]
                 # Sample a random timestep for each image
-                # Use a fixed timestep T (maximum timestep)
-                timesteps = torch.full(
-                    (batch["pixel_values"].shape[0],), 
-                    noise_scheduler.config.num_train_timesteps - 1,
+                # Instead of maximum timestep, use random timesteps
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps,
+                    (batch["pixel_values"].shape[0],),
                     device=depth_latents.device
-                )     
-                timesteps = timesteps.long()
+                ).long()
+
+                # Add classifier-free guidance scale to help with training
+                guidance_scale = 7.5  # Adjust this value
+                # Duplicate inputs for classifier-free guidance
+                concat_latents = torch.cat([image_latents, noisy_latents] * 2)
+                encoder_hidden_states = torch.cat([encoder_hidden_states] * 2)
+                timesteps = torch.cat([timesteps] * 2)
+                
+                # Create unconditional embeddings (zero embeddings)
+                uncond_embeddings = torch.zeros_like(encoder_hidden_states)
+                encoder_hidden_states = torch.cat([uncond_embeddings, encoder_hidden_states])
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
@@ -461,7 +471,8 @@ def main():
                                   class_labels=annotation_emb_s_y, 
                                   return_dict=False)[0]
                 
-                depth_prediction = vae.decode(depth_prediction_latents).sample
+                # Don't decode here - compare in latent space
+                # depth_prediction = vae.decode(depth_prediction_latents).sample
 
                 if not check_tensor(depth_prediction_latents, "depth_prediction"):
                     return float("nan"), float("nan"), float("nan"), (0, 0, 0)
@@ -490,17 +501,23 @@ def main():
                                    class_labels=reconstruction_emb_s_x,
                                    return_dict=False)[0]
                 
+                # Move the decoding after all latent operations
+                reconstructed_rgb_loss = F.mse_loss(reconstructed_rgb_latents, image_latents)
+                
+                # Calculate differences between predictions in latent space
+                l1_diff, l2_diff, cosine_sim = calculate_output_difference(depth_prediction_latents, target)
+
+                # Now decode for visualization
+                depth_prediction = vae.decode(depth_prediction_latents).sample
                 reconstructed_rgb = vae.decode(reconstructed_rgb_latents).sample
+                
                 if not check_tensor(reconstructed_rgb_latents, "recon_prediction"):
                     return float("nan"), float("nan"), float("nan"), (0, 0, 0)
-                
-                reconstructed_rgb_loss = F.mse_loss(reconstructed_rgb_latents, image_latents)
                 
                 if not check_tensor(reconstructed_rgb_loss, "recon_loss"):
                     return float("nan"), float("nan"), float("nan"), (0, 0, 0)
                 
                 total_loss = depth_prediction_loss + reconstructed_rgb_loss
-                l1_diff, l2_diff, cosine_sim = calculate_output_difference(depth_prediction_latents, reconstructed_rgb_latents)
                 accelerator.log(
                                     {
                                         "l1_difference": l1_diff,
